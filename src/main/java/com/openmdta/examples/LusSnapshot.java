@@ -2,35 +2,28 @@ package com.openmdta.examples;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.openmdta.sdk.p_globex.BatchView;
 import com.openmdta.sdk.p_globex.Blocks;
 import com.openmdta.sdk.p_globex.Client;
 import com.openmdta.sdk.p_globex.Environment;
+import com.openmdta.sdk.p_globex.MarketDataUpdate;
 import com.openmdta.sdk.p_globex.MdToken;
-import com.openmdta.sdk.p_globex.Request;
-import com.openmdta.sdk.p_globex.Response;
-import com.openmdta.sdk.p_globex.sbe.gateway_protocol.FeedSnapshotHeaderDecoder;
-import com.openmdta.sdk.p_globex.sbe.gateway_protocol.MarketDataMessageBatchDecoder;
-import com.openmdta.sdk.p_globex.sbe.stream_0.BidAskDecoder;
-import com.openmdta.sdk.p_globex.sbe.stream_0.DecimalEncodingDecoder;
-import com.openmdta.sdk.p_globex.sbe.stream_0.QuoteLevelDecoder;
+import com.openmdta.sdk.p_globex.StreamListener;
+import com.openmdta.sdk.p_globex.model.stream_0.BidAsk;
+import com.openmdta.sdk.p_globex.model.stream_0.QuoteLevel;
 import java.io.IOException;
 import java.io.PrintStream;
-import java.math.BigDecimal;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 /** Finite, source-wide delayed LUS snapshot; one JSON object per stdout line. */
-public final class LusSnapshot implements Request.Listener {
+public final class LusSnapshot implements StreamListener {
     private static final ObjectMapper JSON = new ObjectMapper();
     private final PrintStream output;
-    private final BatchView batch = new BatchView();
-    private final BidAskDecoder quote = Blocks.BID_ASK.decoder().get();
-    private boolean headerSeen;
+    private ObjectNode snapshotHeader;
     private long rows;
 
     LusSnapshot(PrintStream output) {
@@ -57,84 +50,70 @@ public final class LusSnapshot implements Request.Listener {
         var dump = new LusSnapshot(System.out);
         System.err.println("Requesting LUS@lus feed snapshot (DL) from " + Environment.WEBSOCKET);
         try (var client = Client.connect(token).get(20, TimeUnit.SECONDS);
-             var request = client.dataset("lus").quality("DL").streamSnapshot(List.of(Blocks.BID_ASK), dump)) {
+             var request = client.datasetLus().quality("DL").streamSnapshot(List.of(Blocks.BID_ASK), dump)) {
             request.completion().get(Long.getLong("snapshot.timeout.seconds", 300L), TimeUnit.SECONDS);
-            if (!dump.headerSeen) {
-                throw new IOException("Snapshot completed without its header");
-            }
             System.err.println("Snapshot complete: " + dump.rows + " bid/ask records");
         }
     }
 
     @Override
-    public void onResponse(Response response) throws IOException {
-        if (response.templateId() == FeedSnapshotHeaderDecoder.TEMPLATE_ID) {
-            if (headerSeen) {
-                throw new IOException("Duplicate snapshot header");
-            }
-            var header = response.decode(new FeedSnapshotHeaderDecoder());
-            ObjectNode row = JSON.createObjectNode().put("type", "snapshot").put("quality", "DL")
-                    .put("throughMessageId", Long.toUnsignedString(header.throughMessageId()));
-            var gaps = row.putArray("gaps");
-            for (var gap : header.gaps()) {
-                gaps.addObject().put("afterMessageId", Long.toUnsignedString(gap.afterMessageId()))
-                        .put("throughMessageId", Long.toUnsignedString(gap.throughMessageId()));
-            }
-            byte[] datasetBytes = new byte[header.datasetLength()];
-            header.getDataset(datasetBytes, 0, datasetBytes.length);
-            String dataset = new String(datasetBytes, StandardCharsets.UTF_8);
-            if (!"LUS@lus".equals(dataset)) {
-                throw new IOException("Unexpected snapshot dataset: " + dataset);
-            }
-            row.put("dataset", dataset);
-            output.println(row);
-            headerSeen = true;
-        } else if (response.templateId() == MarketDataMessageBatchDecoder.TEMPLATE_ID) {
-            if (!headerSeen) {
-                throw new IOException("Snapshot data arrived before its header");
-            }
-            batch.wrap(response);
-            if (!batch.snapshot() || !"LUS@lus".equals(batch.datasetBytes()
-                    .getStringWithoutLengthUtf8(0, batch.datasetBytes().capacity()))) {
-                throw new IOException("Expected LUS snapshot data");
-            }
-            batch.forEachField((messageId, field) -> {
-                ObjectNode row = JSON.createObjectNode().put("type", "bidAsk").put("dataset", "LUS@lus")
-                        .put("recordKey", batch.recordKey()).put("messageId", Long.toUnsignedString(messageId))
-                        .put("eventTimeMicros", Long.toUnsignedString(field.eventTimeMicros())).put("clear", field.clear());
-                if (!field.clear()) {
-                    field.decode(Blocks.BID_ASK, quote);
-                    writeSide(row, "bid", quote.bid());
-                    writeSide(row, "ask", quote.ask());
-                    if (quote.quoteCondition() == BidAskDecoder.quoteConditionNullValue()) {
-                        row.putNull("quoteCondition");
-                    } else {
-                        row.put("quoteCondition", quote.quoteCondition());
-                    }
-                }
-                output.println(row);
-                rows++;
-            });
-        } else {
-            throw new IOException("Unexpected snapshot response template: " + response.templateId());
+    public void onSnapshotBegin(long throughMessageId) {
+        snapshotHeader = JSON.createObjectNode().put("type", "snapshot").put("dataset", "LUS@lus")
+                .put("quality", "DL").put("throughMessageId", Long.toUnsignedString(throughMessageId));
+        snapshotHeader.putArray("gaps");
+    }
+
+    @Override
+    public void onSnapshotGap(long afterMessageId, long throughMessageId) {
+        snapshotHeader.withArray("gaps").addObject()
+                .put("afterMessageId", Long.toUnsignedString(afterMessageId))
+                .put("throughMessageId", Long.toUnsignedString(throughMessageId));
+    }
+
+    @Override
+    public void onUpdate(MarketDataUpdate update) throws IOException {
+        if (update.isBidAskChanged()) {
+            writeQuote(update.recordKey(), update.messageId(), update.eventTimeMicros(Blocks.BID_ASK), update.bidAsk());
         }
+    }
+
+    @Override
+    public void onSnapshotComplete() throws IOException {
+        flushSnapshotHeader();
+    }
+
+    void writeQuote(String recordKey, long messageId, long eventTimeMicros, Optional<BidAsk> quote) throws IOException {
+        flushSnapshotHeader();
+        ObjectNode row = JSON.createObjectNode().put("type", "bidAsk").put("dataset", "LUS@lus")
+                .put("recordKey", recordKey).put("messageId", Long.toUnsignedString(messageId))
+                .put("eventTimeMicros", Long.toUnsignedString(eventTimeMicros)).put("clear", quote.isEmpty());
+        quote.ifPresent(value -> {
+            writeSide(row, "bid", value.bid());
+            writeSide(row, "ask", value.ask());
+            row.putNull("quoteCondition");
+            value.quoteCondition().ifPresent(condition -> row.put("quoteCondition", condition));
+        });
+        write(row);
+        rows++;
+    }
+
+    private void flushSnapshotHeader() throws IOException {
+        // Gap callbacks precede all records. Keep them together in the first JSON line.
+        if (snapshotHeader != null) {
+            write(snapshotHeader);
+            snapshotHeader = null;
+        }
+    }
+
+    private void write(ObjectNode row) throws IOException {
+        output.println(row);
         if (output.checkError()) {
             throw new IOException("Could not write snapshot to stdout");
         }
     }
 
-    private static void writeSide(ObjectNode row, String side, QuoteLevelDecoder level) {
-        var price = level.price();
-        if (price.mantissa() == DecimalEncodingDecoder.mantissaNullValue()) {
-            row.putNull(side);
-        } else {
-            var value = row.putObject(side).put("price",
-                    BigDecimal.valueOf(price.mantissa()).scaleByPowerOfTen(price.exponent()).toPlainString());
-            if (level.size() == QuoteLevelDecoder.sizeNullValue()) {
-                value.putNull("size");
-            } else {
-                value.put("size", level.size());
-            }
-        }
+    private static void writeSide(ObjectNode row, String side, Optional<QuoteLevel> level) {
+        row.putNull(side);
+        level.ifPresent(value -> row.putObject(side).put("price", value.price().toPlainString()).put("size", value.size()));
     }
 }

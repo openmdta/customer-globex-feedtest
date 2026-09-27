@@ -9,7 +9,7 @@
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <globex.sdk.version>91b4956548b83755a9b5f29bbe1fbc9150c3ce59</globex.sdk.version>
+    <globex.sdk.version>2f828c600af0cc97784c0684e6865d7c76f8ab06</globex.sdk.version>
   </properties>
   <dependencies>
     <dependency>

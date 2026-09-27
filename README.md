@@ -3,8 +3,14 @@
 A Java 17 / Maven example using the public
 [Globex Java SDK](https://github.com/openmdta/sdk-globex-java) to print the entire
 delayed `LUS@lus` bid/ask feed snapshot as newline-delimited JSON, then exit.
-It calls `client.dataset("lus").quality("DL").streamSnapshot(...)` and waits for
-the gateway's `DONE` response. It does not select individual instruments.
+It calls `client.datasetLus().quality("DL").streamSnapshot(...)` and waits for
+request completion. It does not select individual instruments.
+
+The example implements the SDK's `StreamListener`: snapshot callbacks supply
+the boundary and gaps, and `onUpdate` receives typed market data. `update.bidAsk()`
+returns ordinary Java records with optional sides and exact `BigDecimal` prices.
+The SDK handles protocol decoding, message ordering and dataset validation;
+the example only formats the data as JSON.
 
 ## Build
 
@@ -60,7 +66,8 @@ The first stdout line is the snapshot header: dataset, quality, the snapshot's
 `throughMessageId`, and any declared gaps. Following lines contain a record key,
 message ID, event timestamp, clear flag, bid/ask price and size, and quote condition.
 Prices are exact decimal strings; message IDs and microsecond timestamps are
-unsigned decimal strings. Missing sides or sizes are `null`; a clear record
+unsigned decimal strings. Missing sides and quote conditions are `null`; each
+present side contains the SDK's required numeric size. A clear record
 contains no bid/ask values. Record keys are the feed's native keys, not assumed
 to be ISINs. Candles are history data and are not requested in this snapshot.
 

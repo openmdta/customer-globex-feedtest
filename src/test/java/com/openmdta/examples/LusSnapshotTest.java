@@ -3,20 +3,15 @@ package com.openmdta.examples;
 import static org.junit.jupiter.api.Assertions.*;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.openmdta.sdk.p_globex.Format;
-import com.openmdta.sdk.p_globex.Response;
-import com.openmdta.sdk.p_globex.sbe.gateway_protocol.FeedSnapshotHeaderEncoder;
-import com.openmdta.sdk.p_globex.sbe.gateway_protocol.MarketDataMessageBatchEncoder;
-import com.openmdta.sdk.p_globex.sbe.gateway_protocol.Phase;
-import com.openmdta.sdk.p_globex.sbe.stream_0.BidAskEncoder;
-import com.openmdta.sdk.p_globex.sbe.stream_0.DecimalEncodingEncoder;
-import com.openmdta.sdk.p_globex.sbe.stream_0.QuoteLevelEncoder;
+import com.openmdta.sdk.p_globex.model.stream_0.BidAsk;
+import com.openmdta.sdk.p_globex.model.stream_0.QuoteLevel;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
-import org.agrona.concurrent.UnsafeBuffer;
-import org.agrona.sbe.MessageEncoderFlyweight;
+import java.util.Optional;
+import java.util.OptionalInt;
 import org.junit.jupiter.api.Test;
 
 class LusSnapshotTest {
@@ -26,26 +21,38 @@ class LusSnapshotTest {
 
     @Test
     void preservesSnapshotBoundaryGapsAndUnsignedIds() throws Exception {
-        dump.onResponse(header("LUS@lus"));
+        dump.onSnapshotBegin(-2L);
+        dump.onSnapshotGap(5, 9);
+        dump.onSnapshotGap(Long.MAX_VALUE, -2L);
+        dump.onSnapshotComplete();
         var row = json.readTree(bytes.toString(StandardCharsets.UTF_8));
         assertEquals("snapshot", row.path("type").asText());
         assertEquals("LUS@lus", row.path("dataset").asText());
+        assertEquals("DL", row.path("quality").asText());
         assertEquals("18446744073709551614", row.path("throughMessageId").asText());
+        assertEquals(2, row.path("gaps").size());
         assertEquals("5", row.path("gaps").get(0).path("afterMessageId").asText());
         assertEquals("9", row.path("gaps").get(0).path("throughMessageId").asText());
+        assertEquals("18446744073709551614", row.path("gaps").get(1).path("throughMessageId").asText());
     }
 
     @Test
-    void decodesPricesExactlyAndPreservesMissingValues() throws Exception {
-        dump.onResponse(header("LUS@lus"));
-        dump.onResponse(quote(false));
+    void preservesExactPricesMissingValuesAndHeaderOrdering() throws Exception {
+        dump.onSnapshotBegin(-2L);
+        dump.onSnapshotGap(5, 9);
+        var quote = new BidAsk(Optional.of(new QuoteLevel(new BigDecimal("123456.789"), 100)),
+                Optional.empty(), OptionalInt.empty());
+        dump.writeQuote("test\"key", -3L, 1700000000123456L, Optional.of(quote));
+        dump.onSnapshotComplete();
         var lines = bytes.toString(StandardCharsets.UTF_8).lines().toList();
         assertEquals(2, lines.size());
+        assertEquals("snapshot", json.readTree(lines.get(0)).path("type").asText());
+        assertEquals(1, json.readTree(lines.get(0)).path("gaps").size());
         var row = json.readTree(lines.get(1));
         assertEquals("test\"key", row.path("recordKey").asText());
         assertEquals("18446744073709551613", row.path("messageId").asText());
         assertEquals("123456.789", row.path("bid").path("price").asText());
-        assertTrue(row.path("bid").path("size").isNull());
+        assertEquals(100, row.path("bid").path("size").asLong());
         assertTrue(row.path("ask").isNull());
         assertTrue(row.path("quoteCondition").isNull());
         assertEquals("1700000000123456", row.path("eventTimeMicros").asText());
@@ -53,22 +60,36 @@ class LusSnapshotTest {
     }
 
     @Test
-    void clearFieldsDoNotDecodeAnAbsentPayload() throws Exception {
-        dump.onResponse(header("LUS@lus"));
-        dump.onResponse(quote(true));
+    void clearRecordsHaveNoQuoteValues() throws Exception {
+        dump.onSnapshotBegin(10);
+        dump.writeQuote("record", 10, 20, Optional.empty());
         var row = json.readTree(bytes.toString(StandardCharsets.UTF_8).lines().toList().get(1));
         assertTrue(row.path("clear").asBoolean());
         assertFalse(row.has("bid"));
         assertFalse(row.has("ask"));
+        assertFalse(row.has("quoteCondition"));
     }
 
     @Test
-    void rejectsDataWithoutHeaderWrongDatasetAndDuplicateHeaders() throws Exception {
-        assertThrows(IOException.class, () -> dump.onResponse(quote(false)));
-        assertThrows(IOException.class, () -> dump.onResponse(header("OTHER@source")));
-        assertEquals(0, bytes.size());
-        dump.onResponse(header("LUS@lus"));
-        assertThrows(IOException.class, () -> dump.onResponse(header("LUS@lus")));
+    void writesAnEmptySnapshotWithNoGaps() throws Exception {
+        dump.onSnapshotBegin(0);
+        dump.onSnapshotComplete();
+        var lines = bytes.toString(StandardCharsets.UTF_8).lines().toList();
+        assertEquals(1, lines.size());
+        assertTrue(json.readTree(lines.get(0)).path("gaps").isEmpty());
+    }
+
+    @Test
+    void preservesBothSidesAndQuoteCondition() throws Exception {
+        dump.onSnapshotBegin(10);
+        var quote = new BidAsk(Optional.of(new QuoteLevel(new BigDecimal("1E+3"), 0)),
+                Optional.of(new QuoteLevel(new BigDecimal("1001.00"), 4_000_000_000L)), OptionalInt.of(7));
+        dump.writeQuote("record", 10, 20, Optional.of(quote));
+        var row = json.readTree(bytes.toString(StandardCharsets.UTF_8).lines().toList().get(1));
+        assertEquals("1000", row.path("bid").path("price").asText());
+        assertEquals("1001.00", row.path("ask").path("price").asText());
+        assertEquals(4_000_000_000L, row.path("ask").path("size").asLong());
+        assertEquals(7, row.path("quoteCondition").asInt());
     }
 
     @Test
@@ -78,45 +99,9 @@ class LusSnapshotTest {
                 throw new IOException("closed pipe");
             }
         });
-        assertThrows(IOException.class, () -> new LusSnapshot(broken).onResponse(header("LUS@lus")));
-    }
-
-    private static Response header(String dataset) {
-        var encoder = new FeedSnapshotHeaderEncoder().wrap(new UnsafeBuffer(new byte[256]), 0)
-                .throughMessageId(-2L);
-        encoder.gapsCount(1).next().afterMessageId(5).throughMessageId(9);
-        byte[] name = dataset.getBytes(StandardCharsets.UTF_8);
-        encoder.putDataset(name, 0, name.length);
-        return response(encoder);
-    }
-
-    private static Response quote(boolean clear) {
-        var payload = new UnsafeBuffer(new byte[BidAskEncoder.BLOCK_LENGTH]);
-        var quote = new BidAskEncoder().wrap(payload, 0);
-        quote.bid().price().mantissa(123456789).exponent((byte) -3);
-        quote.bid().size(QuoteLevelEncoder.sizeNullValue());
-        quote.ask().price().mantissa(DecimalEncodingEncoder.mantissaNullValue()).exponent((byte) 0);
-        quote.ask().size(0);
-        quote.quoteCondition(BidAskEncoder.quoteConditionNullValue());
-        var encoder = new MarketDataMessageBatchEncoder().wrap(new UnsafeBuffer(new byte[512]), 0)
-                .phase(Phase.SNAPSHOT);
-        encoder.messagesCount(1).next().messageId(-3L).firstField(0).fieldCount(1);
-        encoder.fieldsCount(1).next().schemaId(quote.sbeSchemaId()).templateId(quote.sbeTemplateId())
-                .version(quote.sbeSchemaVersion()).blockLength(quote.sbeBlockLength())
-                .eventTimeMicros(1700000000123456L).clear((short) (clear ? 1 : 0))
-                .payloadOffset(0).payloadLength(clear ? 0 : payload.capacity());
-        encoder.gapsCount(0);
-        byte[] key = "test\"key".getBytes(StandardCharsets.UTF_8);
-        byte[] dataset = "LUS@lus".getBytes(StandardCharsets.UTF_8);
-        encoder.putDatasetRecordKey(key, 0, key.length).putDataset(dataset, 0, dataset.length)
-                .putPayload(payload, 0, clear ? 0 : payload.capacity());
-        return response(encoder);
-    }
-
-    private static Response response(MessageEncoderFlyweight encoder) {
-        byte[] body = new byte[encoder.encodedLength()];
-        encoder.buffer().getBytes(encoder.offset(), body);
-        return new Response.Owned(new Format(encoder.sbeSchemaId(), encoder.sbeTemplateId(),
-                encoder.sbeSchemaVersion(), encoder.sbeBlockLength()), body).view();
+        var failed = new LusSnapshot(broken);
+        failed.onSnapshotBegin(0);
+        assertThrows(IOException.class, failed::onSnapshotComplete);
+        assertThrows(IOException.class, () -> failed.writeQuote("record", 10, 20, Optional.empty()));
     }
 }
